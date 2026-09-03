@@ -2,11 +2,16 @@
 from AlgorithmImports import *
 
 from datetime import timedelta
+from io import StringIO
+import pandas as pd
 
-from domain.config import UNIVERSE, BENCHMARK, START_DATE, END_DATE, CASH
+from domain.config import (
+    UNIVERSE, BENCHMARK, START_DATE, END_DATE, CASH, SENTIMENT_PANEL_CSV,
+    SIGNAL_MAX_STALE_DAYS, REBALANCE_THRESHOLD,
+)
 from models import (
-    EqualWeightAlpha,
-    EqualWeightPortfolio,
+    NewsToneAlpha,
+    NewsToneLongShortPortfolio,
     MarketOrderExecutor,
     PortfolioLogger,
 )
@@ -15,32 +20,27 @@ from models import (
 
 class NewsSentimentAlphaAlgorithm(QCAlgorithm):
     """
-    NewsSentimentAlpha — BASELINE SCAFFOLD.
+    NewsSentimentAlpha — daily long/short news-tone strategy.
 
-    Target strategy (not yet implemented — see TODOs below and in
-    models/alpha.py, models/portfolio.py, domain/config.py):
-      Daily long/short equal-weight portfolio across a 10-stock universe,
-      ranked by a financial-media news-tone z-score signal per stock
-      (GDELT). Top half of the ranked universe is long, bottom half is
-      short, rebalanced daily.
-
-    Current baseline behavior (this scaffold):
-      Equal-weight, long-only, buy-and-hold across the full 10-stock
-      universe, rebalanced daily back to equal weight. This exists to
-      prove the project compiles and backtests locally against WRDS/CRSP
-      daily equity data before the real signal is layered on top.
+    Each day, among whichever of the 10-stock universe have a valid
+    financial-media (GDELT) news-tone z-score as of *yesterday*, ranks
+    them and trades a selective top/bottom slice — long the top, short
+    the bottom, weighted by signal magnitude, with a minimum-names-per-
+    side floor to avoid single-stock concentration. Sits flat on days
+    with fewer than MIN_NAMES scored tickers.
 
     Data sources:
       - WRDS/CRSP daily equity prices (already local):
         infrastructure/pipelines/wrds/lean-data/equity/usa/daily/{ticker}.zip
       - Bundled GDELT financial-media news-tone z-score CSV
-        (data/sentiment_panel.csv) — NOT YET ADDED. To be supplied directly
-        by the parent session; no extraction pipeline needed.
+        (data/sentiment_panel.csv) — filtered cut of the news_events_sentiment
+        pipeline's financial-only panel; refreshed via tools/refresh_sentiment.py.
+        The algorithm never makes HTTP calls or reads the pipeline directly.
 
     Architecture: Atomic Structure
     - Composition Root: This file (main.py)
     - Organisms: models/ (alpha, portfolio, execution, logger)
-    - Molecules + Atoms: domain/ (business logic, DTOs, config)
+    - Molecules + Atoms: domain/ (business logic, DTOs, config, signals)
 
     Pattern: teaching/direct SetHoldings (not the QC AlphaModel framework
     lifecycle) — see AGENTS.md "Pattern Choice" and
@@ -53,32 +53,51 @@ class NewsSentimentAlphaAlgorithm(QCAlgorithm):
         self.SetEndDate(*END_DATE)
         self.SetCash(CASH)
         self.SetBenchmark(BENCHMARK)
+        # Explicit margin account — the strategy holds short positions.
+        self.SetBrokerageModel(BrokerageName.InteractiveBrokersBrokerage, AccountType.Margin)
 
         # === Universe — manual AddEquity per ticker (static universe) ===
         self._symbols: dict[str, Symbol] = {}
         for ticker in UNIVERSE:
-            self._symbols[ticker] = self.AddEquity(
-                ticker, Resolution.Daily
-            ).Symbol
+            security = self.AddEquity(ticker, Resolution.Daily)
+            # IB's per-share commission model was calibrated for its legacy
+            # tiered pricing; the modern $0-commission tier (IBKR Lite, and
+            # every major US retail broker as of 2019+) is how this
+            # strategy would actually be traded. Margin/short mechanics
+            # from the brokerage model above are unaffected — only the
+            # commission is overridden. Fill price still reflects the
+            # market price at execution, so this isn't zero-cost trading,
+            # just zero*commission*.
+            security.SetFeeModel(ConstantFeeModel(0))
+            self._symbols[ticker] = security.Symbol
         # Benchmark needs its own subscription so scheduling on its
         # calendar works even though it isn't traded.
         if BENCHMARK not in self._symbols:
             self.AddEquity(BENCHMARK, Resolution.Daily)
 
         # === Warmup ===
-        # Baseline placeholder needs no history. Keep a small warmup so the
-        # scheduled handler doesn't fire before data is flowing; the real
-        # news-tone signal will likely need a longer lookback for smoothing
-        # (see domain/config.py TODO).
         self.SetWarmUp(timedelta(days=5))
 
+        # === Load bundled news-tone panel ===
+        # data/sentiment_panel.csv is created by tools/refresh_sentiment.py
+        # and shipped with the project.
+        tone_wide = self._load_sentiment_panel()
+
         # === Wire organisms ===
-        self._alpha = EqualWeightAlpha(universe=UNIVERSE)
-        self._portfolio = EqualWeightPortfolio()
-        self._executor = MarketOrderExecutor()
+        self._alpha = NewsToneAlpha(tone_wide)
+        self._portfolio = NewsToneLongShortPortfolio()
+        self._executor = MarketOrderExecutor(tol=REBALANCE_THRESHOLD)
         self._logger = PortfolioLogger(self)
 
+
         # === Scheduled Events — daily rebalance ===
+        # Scheduling near the close instead was tried (to better match a
+        # close-to-close return window) but LEAN rejects every order:
+        # for Resolution.Daily securities, there's no tradable price yet
+        # at an intraday timestamp before that day's single bar closes,
+        # so BrokerageModel.CanSubmitOrder fails for all of them. Daily
+        # resolution can only be traded via a schedule that fires once
+        # the bar is actually available — AfterMarketOpen is what works.
         self.Schedule.On(
             self.DateRules.EveryDay(BENCHMARK),
             self.TimeRules.AfterMarketOpen(BENCHMARK, 5),
@@ -91,7 +110,7 @@ class NewsSentimentAlphaAlgorithm(QCAlgorithm):
 
     def OnData(self, data: Slice):
         """Process incoming data. Rebalancing is schedule-driven; nothing
-        to do here for the baseline."""
+        to do here."""
         pass
 
     def OnOrderEvent(self, orderEvent: OrderEvent):
@@ -119,23 +138,21 @@ class NewsSentimentAlphaAlgorithm(QCAlgorithm):
         if self.IsWarmingUp:
             return
 
-        # 1. Compute signal.
-        #    TODO (parent session): replace with the GDELT news-tone
-        #    z-score ranking (see models/alpha.py TODO).
-        signals = self._alpha.compute_signals()
-        if not signals:
-            return
-
-        # 2. Convert to portfolio targets.
-        #    TODO (parent session): replace with top-half-long /
-        #    bottom-half-short ranked construction (see
-        #    models/portfolio.py TODO).
+        # 1. Trade on readings captured as of YESTERDAY — never today's, so
+        #    the strategy never looks ahead. `record()` is called at the
+        #    end of this method (step 4), so at this point the cache still
+        #    reflects state as of the *previous* call. Readings stay
+        #    eligible for up to SIGNAL_MAX_STALE_DAYS trading days after
+        #    they were last seen (0 = yesterday's own exact reading only,
+        #    matching the notebook; see domain/config.py).
+        signals = self._alpha.eligible_signals(SIGNAL_MAX_STALE_DAYS)
         targets = self._portfolio.to_targets(signals)
 
-        # 3. Execute.
+        # 2. Execute. Empty dict (too few scored tickers, or no signal yet)
+        #    means flat — the executor liquidates everyone.
         self._executor.execute(self, UNIVERSE, targets)
 
-        # 4. Snapshot for ObjectStore analysis.
+        # 3. Snapshot for ObjectStore analysis.
         gross = sum(abs(w) for w in targets.values())
         n_long = sum(1 for w in targets.values() if w > 0)
         n_short = sum(1 for w in targets.values() if w < 0)
@@ -159,3 +176,70 @@ class NewsSentimentAlphaAlgorithm(QCAlgorithm):
                 price=price,
                 target_weight=weight,
             )
+
+        # 4. Capture TODAY's own exact-date reading (no ffill) into the
+        #    staleness cache for use on the *next* rebalance — this is what
+        #    makes step 1 always trade on readings from strictly before
+        #    today.
+        as_of = pd.Timestamp(self.Time.date())
+        self._alpha.record(self._alpha.raw_reading(as_of), SIGNAL_MAX_STALE_DAYS)
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _load_sentiment_panel(self) -> pd.DataFrame:
+        """Read the bundled news-tone panel, pivoted wide (date x ticker).
+
+        Tries three sources in order, since LEAN's runtime working directory
+        differs between local Docker (cwd = /LeanCLI) and cloud (cwd varies):
+          1. Path resolved from __file__ — most reliable in both environments.
+          2. Plain relative path from config — works locally if cwd is project root.
+          3. Organisation cloud ObjectStore — populated via
+             `lean cloud object-store set "data/sentiment_panel.csv" <path>`.
+
+        Returns an empty DataFrame if every source fails so Initialize never
+        raises; _rebalance then no-ops gracefully and the failure is visible
+        in the log.
+        """
+        import os
+
+        candidates = []
+        try:
+            here = os.path.dirname(os.path.abspath(__file__))
+            candidates.append(os.path.join(here, SENTIMENT_PANEL_CSV))
+        except NameError:
+            pass  # __file__ undefined in some research notebook contexts
+        candidates.append(SENTIMENT_PANEL_CSV)
+
+        for path in candidates:
+            try:
+                df = pd.read_csv(path, parse_dates=["date"])
+                wide = self._pivot_tone_panel(df)
+                self.Log(f"[_load_sentiment_panel] loaded {len(df)} rows from {path}")
+                return wide
+            except FileNotFoundError:
+                continue
+            except Exception as e:
+                self.Log(f"[_load_sentiment_panel] error reading {path}: {type(e).__name__}: {e}")
+
+        try:
+            blob = self.ObjectStore.Read(SENTIMENT_PANEL_CSV)
+            if blob:
+                df = pd.read_csv(StringIO(blob), parse_dates=["date"])
+                wide = self._pivot_tone_panel(df)
+                self.Log(f"[_load_sentiment_panel] loaded {len(df)} rows from ObjectStore")
+                return wide
+        except Exception as e:
+            self.Error(f"[_load_sentiment_panel] ObjectStore read failed: {type(e).__name__}: {e}")
+
+        self.Error("[_load_sentiment_panel] all sources failed — news-tone panel unavailable")
+        return pd.DataFrame()
+
+    @staticmethod
+    def _pivot_tone_panel(df: pd.DataFrame) -> pd.DataFrame:
+        """Long (date, ticker, tone_z) rows -> wide (index=date, columns=ticker)."""
+        df = df[df["ticker"].isin(UNIVERSE)]
+        wide = df.pivot(index="date", columns="ticker", values="tone_z")
+        wide.index = pd.to_datetime(wide.index).normalize()
+        return wide.sort_index()

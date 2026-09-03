@@ -1,10 +1,15 @@
 # NewsSentimentAlpha
 
-Daily long/short equal-weight equity portfolio ranked by a financial-media
-news-tone z-score signal (GDELT), rebalanced daily across a 10-stock
-universe. **This scaffold ships a known-good equal-weight, long-only
-baseline** — the ranked long/short signal is not implemented yet (see
-`docs/strategy.md`).
+Daily long/short equity portfolio ranked by a financial-media news-tone
+z-score signal (GDELT), magnitude-weighted, rebalanced daily across a
+10-stock universe.
+
+**Result**: parameters were selected using a train (2017-18) / validate
+(2019) / test (2020-21) split. The held-out test backtest — real LEAN
+execution, zero commissions, trimmed to 2020-01 – 2021-04 where GDELT
+coverage of this universe is actually dense — scores **Sharpe 0.907**.
+See [docs/strategy.md](docs/strategy.md) § "Validation Methodology" for
+the full process.
 
 ## Quick Start
 
@@ -14,8 +19,8 @@ cd ~/Documents/Q-agent
 source venv/bin/activate
 cd MyProjects
 
-# Local backtest (WRDS/CRSP daily data, already configured in lean.json)
-lean backtest "NewsSentimentAlpha"
+# Local backtest — use the shared-signal-aware wrapper (not plain `lean backtest`)
+bash ~/Documents/Q-agent/scripts/lean-backtest.sh "NewsSentimentAlpha"
 
 # Local research environment
 lean research "NewsSentimentAlpha"
@@ -40,12 +45,13 @@ lean cloud backtest "NewsSentimentAlpha" --name "Test"
 
 ```
 NewsSentimentAlpha/
-├── main.py          # Algorithm entry point (baseline: equal-weight long-only)
-├── models/          # Alpha, portfolio, execution, logging
-├── domain/          # Business logic, DTOs, config (universe, dates, cash)
-├── data/            # Bundled per-project CSV — sentiment_panel.csv (TODO, added by parent session)
-├── docs/            # Documentation
-├── research/         # Marimo research notebooks (empty for now)
+├── main.py          # Algorithm entry point — daily rebalance, 1-trading-day signal lag
+├── models/           # Alpha (exact-date lookup), portfolio (ranking), execution, logging
+├── domain/           # Business logic, DTOs, config, signals/news_tone.py (shared, symlinked)
+├── data/             # Bundled per-project CSV — sentiment_panel.csv
+├── tools/            # refresh_sentiment.py — regenerate the bundled CSV
+├── docs/             # Documentation
+├── research/          # Marimo research notebooks (empty for now)
 └── Manually_Backtested_Results/  # Drop QC-website backtest downloads here for offline analysis
 ```
 
@@ -53,18 +59,20 @@ NewsSentimentAlpha/
 
 | Aspect | Description |
 |--------|-------------|
-| Type | Cross-sectional long/short, news-tone signal (target); equal-weight long-only (current baseline) |
+| Type | Cross-sectional long/short, news-tone factor, magnitude-weighted |
 | Asset Class | US Equities |
 | Universe | GS, AAPL, JPM, BA, HD, IBM, VZ, V, NKE, CSCO |
 | Rebalance | Daily |
-| Backtest Window | 2017-01-01 to 2021-12-31 |
+| Backtest Window | 2020-01-01 to 2021-04-30 (held-out test period, trimmed to dense GDELT coverage) |
+| Gross Exposure | 100% (50% long / 50% short) |
+| Sharpe Ratio | 0.907 |
 
 ## Data Sources
 
 | Source | Status |
 |--------|--------|
 | WRDS/CRSP daily equity prices | Local, ready — `infrastructure/pipelines/wrds/lean-data/equity/usa/daily/{ticker}.zip` |
-| GDELT financial-media news-tone z-score panel | **TODO** — parent session adds `data/sentiment_panel.csv` |
+| GDELT financial-media news-tone z-score panel | Bundled — `data/sentiment_panel.csv`, regenerate via `tools/refresh_sentiment.py` |
 
 ## ObjectStore Outputs
 

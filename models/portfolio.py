@@ -1,36 +1,47 @@
 # region imports
 from AlgorithmImports import *
+
+from domain.config import MIN_NAMES, SELECT_FRAC, N_FLOOR
+from domain.signals.news_tone import rank_magnitude_weighted_targets
 # endregion
 
 
-class EqualWeightPortfolio:
+class NewsToneLongShortPortfolio:
     """
-    Portfolio construction organism for NewsSentimentAlpha — BASELINE
-    PLACEHOLDER.
+    Portfolio construction organism for NewsSentimentAlpha.
 
-    Converts the flat baseline signal into equal-weight long-only targets
-    (simple buy-and-hold across the universe, rebalanced back to equal
-    weight on each scheduled call).
-
-    TODO (parent session): replace `to_targets` with the ranked long/short
-    construction — sort tickers by news-tone z-score, go long the top half
-    and short the bottom half, weights equal-weighted (or z-score-weighted)
-    within each side, normalized to the desired gross exposure.
+    Converts raw tone-z scores into long/short targets: a selective
+    top/bottom slice of whichever tickers have a signal today (at least
+    `n_floor` names per side, to avoid a concentrated single-stock bet),
+    weighted by signal magnitude within each side. Delegates the ranking
+    math to the pure shared signal at `domain/signals/news_tone.py`
+    (symlink to MyProjects/shared/signals/).
 
     Layer: ORGANISM (orchestrates portfolio construction).
     """
 
+    def __init__(
+        self,
+        min_names: int = MIN_NAMES,
+        frac: float = SELECT_FRAC,
+        n_floor: int = N_FLOOR,
+    ):
+        self.min_names = min_names
+        self.frac = frac
+        self.n_floor = n_floor
+
     def to_targets(self, signals: dict[str, float]) -> dict[str, float]:
-        """Equal-weight long-only targets across every ticker with a signal.
+        """Ranked, magnitude-weighted long/short targets from raw tone-z scores.
 
         Args:
-            signals: dict[ticker, signal] from EqualWeightAlpha.
+            signals: dict[ticker, tone_z] from NewsToneAlpha.
 
         Returns:
-            dict[ticker, weight]: equal weight (1/N) per ticker, long only,
-            summing to 1.0 gross exposure.
+            dict[ticker, weight]: see rank_magnitude_weighted_targets.
+            Empty dict (flat) if fewer than `min_names` tickers have a
+            signal, or if the cross-section is too narrow to support
+            `n_floor` names on both sides.
         """
-        if not signals:
-            return {}
-        weight = 1.0 / len(signals)
-        return {ticker: weight for ticker in signals}
+        return rank_magnitude_weighted_targets(
+            signals, frac=self.frac, min_names=self.min_names, n_floor=self.n_floor
+        )

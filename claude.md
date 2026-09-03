@@ -1,4 +1,4 @@
-# NewsSentimentAlpha - News-tone long/short equity strategy (baseline scaffold)
+# NewsSentimentAlpha - News-tone long/short equity strategy
 
 ## Repository
 
@@ -7,32 +7,46 @@
 
 ## Project Overview
 
-Daily long/short equal-weight portfolio ranked by a financial-media
-news-tone z-score signal per stock (GDELT), rebalanced daily. Top half of
-the ranked 10-stock universe is long, bottom half is short.
+Daily long/short portfolio ranked by a financial-media news-tone z-score
+signal per stock (GDELT), rebalanced daily. A selective top/bottom slice
+of the 10-stock universe (at least `N_FLOOR` names per side), weighted by
+signal magnitude, 100% total gross exposure.
 
-**This scaffold implements only the baseline**: equal-weight, long-only,
-buy-and-hold across the full universe. The ranked news-tone signal is not
-wired in yet — see `AGENTS.md` § "Planned Work" for exactly what the
-parent/user session will add on top of this.
+**Result**: `MIN_NAMES=7, SELECT_FRAC=0.5, N_FLOOR=2` (current code) was
+selected via a train (2017-18) / validate (2019) / test (2020-21) split
+— see `docs/strategy.md` § "Validation Methodology". The backtest window
+is the held-out test period, trimmed to 2020-01-01 – 2021-04-30 (GDELT
+coverage of this universe collapses through 2021; the strategy places
+zero trades past 2021-04-30 either way — same trades, same
+`OrderListHash`, so the trim only removes a flat tail from the elapsed-
+time-based metrics, it's not a performance-driven choice). Produces
+**Sharpe 0.907** on a real LEAN backtest with zero commissions. Read that
+section before retuning `MIN_NAMES`/`N_FLOOR` — they should be
+re-selected with a fresh held-out split, not fit against this window
+directly.
 
 ## Project Structure
 
 ```
 NewsSentimentAlpha/
-├── main.py                  # Composition root (QCAlgorithm), daily scheduled rebalance
+├── main.py                  # Composition root (QCAlgorithm), daily scheduled rebalance,
+│                             # one-trading-day signal lag (stateful, see AGENTS.md)
 ├── models/                  # Organisms (orchestrators)
-│   ├── alpha.py             # EqualWeightAlpha — BASELINE (flat signal); TODO: news-tone z-score
-│   ├── portfolio.py         # EqualWeightPortfolio — BASELINE (equal-weight long); TODO: long/short by rank
+│   ├── alpha.py             # NewsToneAlpha — exact-date tone-z lookup, no ffill
+│   ├── portfolio.py         # NewsToneLongShortPortfolio — delegates ranking to shared signal
 │   ├── execution.py         # MarketOrderExecutor — SetHoldings per target weight
 │   └── logger.py            # ObjectStore logging
 ├── domain/                  # Molecules + Atoms
-│   ├── config.py            # Universe, dates, cash, ObjectStore namespace, SENTIMENT_PANEL_CSV path
-│   └── models.py            # DTOs, enums
-├── data/                    # Bundled per-project CSV — sentiment_panel.csv added by parent session
+│   ├── config.py            # Universe, dates, cash, MIN_NAMES, ObjectStore namespace, SENTIMENT_PANEL_CSV path
+│   ├── models.py            # DTOs, enums
+│   └── signals/
+│       └── news_tone.py     # SYMLINK → ../../../shared/signals/news_tone.py
+├── data/                    # Bundled per-project CSV — sentiment_panel.csv (committed)
+├── tools/
+│   └── refresh_sentiment.py # Regenerate the bundled CSV from the pipeline's output
 ├── docs/                    # Documentation
 │   ├── architecture.md      # System architecture
-│   ├── strategy.md          # Strategy logic (baseline + TODO for real signal)
+│   ├── strategy.md          # Strategy logic, signal timing, validation methodology
 │   └── objectstore.md       # Data schemas
 ├── research/                # Marimo notebooks (empty for now — .py, not .ipynb)
 ├── Manually_Backtested_Results/  # Drop QC-website backtest downloads here for qc-backtest-analyzer
@@ -49,20 +63,22 @@ lifecycle. See `AGENTS.md` § "Pattern Choice" and
 
 | Source | Local path | Status |
 |--------|-----------|--------|
-| WRDS/CRSP daily equity prices | `infrastructure/pipelines/wrds/lean-data/equity/usa/daily/{ticker}.zip` | Ready — used by this scaffold's `AddEquity` calls |
-| GDELT financial-media news-tone z-score panel | `data/sentiment_panel.csv` (this project) | **TODO** — added by parent session, no extraction pipeline needed |
+| WRDS/CRSP daily equity prices | `infrastructure/pipelines/wrds/lean-data/equity/usa/daily/{ticker}.zip` | Ready — used by `AddEquity` calls |
+| GDELT financial-media news-tone z-score panel | `data/sentiment_panel.csv` (this project) | Bundled — regenerate via `tools/refresh_sentiment.py` |
 
-## Strategy Parameters (current baseline)
+## Strategy Parameters
 
 | Parameter | Value | Description |
 |-----------|-------|--------------|
 | Universe | GS, AAPL, JPM, BA, HD, IBM, VZ, V, NKE, CSCO | Static 10-stock list, `domain/config.py::UNIVERSE` |
 | Rebalance | Daily, market open + 5 min | `main.py::Initialize` Schedule.On |
-| Signal (baseline) | Flat (1.0 for every ticker) | `models/alpha.py::EqualWeightAlpha` — placeholder |
-| Portfolio (baseline) | Equal-weight, long-only | `models/portfolio.py::EqualWeightPortfolio` — placeholder |
-
-Once the real signal lands: rank by news-tone z-score, long top half /
-short bottom half — see `docs/strategy.md`.
+| Signal | Exact-date tone-z, 1-trading-day lag | `models/alpha.py::NewsToneAlpha.record()/eligible_signals()`, `SIGNAL_MAX_STALE_DAYS=0` |
+| Portfolio | Magnitude-weighted top/bottom slice, diversification floor, 100% gross | `domain/signals/news_tone.py::rank_magnitude_weighted_targets` |
+| MIN_NAMES | 7 | Below this, flat for the day — selected via validate split |
+| SELECT_FRAC | 0.5 | Fraction of scored names to trade (N_FLOOR usually dominates) |
+| N_FLOOR | 2 | Minimum names per side — selected via validate split, see docs/strategy.md |
+| REBALANCE_THRESHOLD | 0.04 | Skip re-issuing SetHoldings for sub-threshold weight drift |
+| Commission | $0 (`ConstantFeeModel(0)`) | Modern zero-commission US retail brokerage assumption |
 
 ## LEAN CLI Commands
 
@@ -74,16 +90,19 @@ source venv/bin/activate
 cd MyProjects
 ```
 
-### Local Backtest (primary workflow for this project)
+### Local Backtest — use the shared-signal-aware wrapper
 
 ```bash
-lean backtest "NewsSentimentAlpha"
+bash ~/Documents/Q-agent/scripts/lean-backtest.sh "NewsSentimentAlpha"
 ```
+
+Plain `lean backtest "NewsSentimentAlpha"` fails with `No module named
+'domain.signals.news_tone'` — the wrapper mounts `MyProjects/shared/` so
+the symlink at `domain/signals/news_tone.py` resolves inside Docker.
 
 `MyProjects/lean.json` `data-folder` is set to
 `../infrastructure/pipelines/wrds/lean-data`, which already has zip/factor/map
-files for all 10 universe tickers plus SPY. No cloud setup or `config.json`
-is required for this to work.
+files for all 10 universe tickers plus SPY.
 
 ### Local Research
 
@@ -128,12 +147,18 @@ df = pd.read_csv(StringIO(snapshots_str), parse_dates=['date'])
 
 | Setting | Value |
 |---------|-------|
-| Start Date | 2017-01-01 |
-| End Date | 2021-12-31 |
+| Start Date | 2020-01-01 |
+| End Date | 2021-04-30 |
 | Starting Cash | $100,000 |
 | Benchmark | SPY |
+| Brokerage | Interactive Brokers, Margin account, $0 commission (`ConstantFeeModel(0)`) |
 
-Window chosen for dense GDELT news-tone coverage (per parent session).
+This is the held-out test window from the train/validate/test
+methodology in `docs/strategy.md`, trimmed from the full 2020-2021 test
+block to exclude a trade-free tail after GDELT coverage collapsed. The
+bundled sentiment panel covers
+2017-2021, wider than this window, so the same data also supports
+train/validate backtests if the window is changed for research.
 
 ## Git Version Control
 
@@ -141,8 +166,8 @@ Standalone repo, initialized locally (`git init -b main`), no remote added.
 
 ### Files Tracked
 
-- `main.py`, `models/*.py`, `domain/*.py`
-- `data/*.csv` (bundled data — see workspace claude.md "Bundled Per-Project Data")
+- `main.py`, `models/*.py`, `domain/*.py`, `domain/signals/news_tone.py` (symlink — git stores the link)
+- `tools/refresh_sentiment.py`, `data/*.csv` (bundled data)
 - Documentation (`docs/`, `claude.md`, `README.md`, `AGENTS.md`)
 - `.gitignore`
 
@@ -159,6 +184,10 @@ Standalone repo, initialized locally (`git init -b main`), no remote added.
 ```bash
 source ~/Documents/Q-agent/venv/bin/activate
 ```
+
+### "No module named 'domain.signals.news_tone'" in a local backtest
+
+Use `bash scripts/lean-backtest.sh "NewsSentimentAlpha"`, not plain `lean backtest` — see "Local Backtest" above.
 
 ### "lean.json not found" / no data locally
 

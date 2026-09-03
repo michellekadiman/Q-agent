@@ -37,9 +37,10 @@ class SignalDirection(Enum):
 class Signal:
     """Trading signal DTO.
 
-    TODO (parent session): the real signal will carry a news-tone z-score
-    per ticker instead of a fixed strength — extend or replace this DTO
-    when the ranked long/short logic is wired in.
+    Not currently used — main.py passes plain `dict[ticker, tone_z]` /
+    `dict[ticker, weight]` between NewsToneAlpha and
+    NewsToneLongShortPortfolio instead. Kept for parity with the atomic
+    scaffold; wire it in if a richer per-signal record becomes useful.
     """
     symbol: str
     direction: SignalDirection
