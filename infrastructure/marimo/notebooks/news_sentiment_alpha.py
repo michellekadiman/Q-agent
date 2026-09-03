@@ -84,6 +84,7 @@ def _():
         FINANCIAL_PANEL,
         GENERAL_PANEL,
         HOLD_DAYS,
+        REPO,
         SCALE,
         WRDS_DAILY,
         np,
@@ -456,6 +457,100 @@ def _(mo):
       flags (from the WRDS/IBES pipeline) to separate "tone moved because of
       real news" from "tone moved because of noise."
     """)
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    ## 6. From Research to Tradeable Backtest
+
+    The signal above was implemented as a full QuantConnect/LEAN algorithm —
+    `MyProjects/NewsSentimentAlpha` — with a magnitude-weighted, diversified
+    portfolio construction (not the simple equal-weight/half-split test
+    above), with parameters selected via a strict train (2017-18) / validate
+    (2019) / test (2020-21) split rather than tuning against the full
+    window. What follows is the actual LEAN backtest result on the held-out
+    test period, never touched during parameter selection — trimmed to
+    2020-01 through 2021-04, since GDELT coverage of this universe collapses
+    through 2021 and the strategy places zero trades past that point
+    regardless of how far the window extends (confirmed by comparing trades
+    across both window lengths — identical).
+    """)
+    return
+
+
+@app.cell(hide_code=True)
+def _(REPO, mo, pd):
+    BACKTEST_SNAPSHOTS = REPO / "MyProjects" / "storage" / "news_sentiment_alpha" / "daily_snapshots.csv"
+
+    mo.stop(
+        not BACKTEST_SNAPSHOTS.exists(),
+        mo.callout(
+            mo.md(
+                f"LEAN backtest ObjectStore output not found at `{BACKTEST_SNAPSHOTS}` — run "
+                "`bash scripts/lean-backtest.sh \"NewsSentimentAlpha\"` from the workspace root first."
+            ),
+            kind="warn",
+        ),
+    )
+
+    backtest_snapshots = pd.read_csv(BACKTEST_SNAPSHOTS, parse_dates=["date"]).set_index("date")
+    backtest_active = backtest_snapshots[backtest_snapshots["gross_exposure"] > 0]
+
+    mo.md(
+        f"Loaded **{len(backtest_snapshots)} trading days** "
+        f"({backtest_snapshots.index[0].date()} → {backtest_snapshots.index[-1].date()})  |  "
+        f"active days: **{len(backtest_active)}**"
+    )
+    return (backtest_snapshots,)
+
+
+@app.cell(hide_code=True)
+def _(backtest_snapshots, mo, np):
+    _daily_ret = backtest_snapshots["nav"].pct_change().dropna()
+    _active_ret = _daily_ret[_daily_ret != 0]
+    _final_nav = backtest_snapshots["nav"].iloc[-1]
+
+    backtest_sharpe = (_active_ret.mean() / _active_ret.std()) * np.sqrt(252)
+    backtest_cagr = (backtest_snapshots["nav"].iloc[-1] / backtest_snapshots["nav"].iloc[0]) ** (
+        365.25 / (backtest_snapshots.index[-1] - backtest_snapshots.index[0]).days
+    ) - 1
+    backtest_maxdd = ((backtest_snapshots["nav"] - backtest_snapshots["nav"].cummax()) / backtest_snapshots["nav"].cummax()).min()
+    backtest_net_profit = backtest_snapshots["nav"].iloc[-1] / backtest_snapshots["nav"].iloc[0] - 1
+
+    mo.md(
+        "**LEAN backtest — held-out test period, trimmed to dense GDELT coverage (2020-01-01 to 2021-04-30), zero commissions**\n\n"
+        "| Metric | Value | Source |\n|---|---|---|\n"
+        f"| CAGR | {backtest_cagr:.2%} | recomputed from ObjectStore NAV |\n"
+        f"| Max Drawdown | {backtest_maxdd:.2%} | recomputed from ObjectStore NAV |\n"
+        f"| Net Profit | {backtest_net_profit:.2%} | recomputed from ObjectStore NAV |\n"
+        f"| Final NAV | ${_final_nav:,.0f} | recomputed from ObjectStore NAV |\n"
+        f"| Sharpe Ratio (naive, mean/std × √252) | {backtest_sharpe:.3f} | recomputed here |\n"
+        "| Sharpe Ratio (LEAN's official statistic) | **0.907** | LEAN backtest report |\n\n"
+        "CAGR, drawdown, and net profit recomputed from the ObjectStore NAV series "
+        "match LEAN's own report closely. Sharpe does not — LEAN's official Sharpe "
+        "Ratio statistic uses an internal methodology (likely a risk-free-rate "
+        "adjustment) that a naive mean/std calculation on the realized return "
+        "series doesn't reproduce exactly. **0.907 is the authoritative number** — "
+        "see `MyProjects/NewsSentimentAlpha/docs/strategy.md` for the full "
+        "validation methodology behind it, including why the window is trimmed "
+        "from the full 2020-2021 test block."
+    )
+    return
+
+
+@app.cell(hide_code=True)
+def _(backtest_snapshots, plt):
+    _fig, _ax = plt.subplots(figsize=(14, 5))
+    _ax.plot(backtest_snapshots.index, backtest_snapshots["nav"], color="#58a6ff", linewidth=1.8, label="NewsSentimentAlpha (LEAN backtest, test period)")
+    _ax.axhline(100_000, color="#8b949e", linewidth=0.8, linestyle="--")
+    _ax.set_title("NewsSentimentAlpha — Held-Out Test Backtest (2020-01 to 2021-04)")
+    _ax.set_ylabel("Portfolio Value ($, starting $100,000)")
+    _ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f"${x:,.0f}"))
+    _ax.legend(framealpha=0.3)
+    plt.tight_layout()
+    plt.show()
     return
 
 
